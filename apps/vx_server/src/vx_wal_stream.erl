@@ -34,6 +34,10 @@
 -define(POLL_RETRY_MIN, 10).
 -define(POLL_RETRY_MAX, timer:seconds(10)).
 
+-define(READ_TXN(TxId, DcId, TxCommitTime, TxOffset, Term),
+        {TxId, DcId, TxCommitTime, TxOffset, Term}
+       ).
+
 -record(data, {client :: pid() | undefined,
                mon_ref:: reference() | undefined,
                file_status :: more_data | eof,
@@ -46,6 +50,13 @@
                last_read_txid :: antidote:txid() | undefined,
                %% Last txid we have been notified about
                last_notif_txid :: antidote:txid() | undefined,
+
+               %% NOTE: Keeps last tx per dc, so that we can filter tx
+               %% that we have already send previously. No two transactions
+               %% from the same DC can have a same clock_time on a partition
+               last_send_map = #{} ::
+                 #{ antidote:dcid() => antidote:clock_time() },
+               last_send_offset = 0 :: non_neg_integer(),
 
                %% Retry for file polling
                file_poll_tref :: reference() | undefined,
@@ -158,7 +169,7 @@ init(_Args) ->
 
     ok = vx_wal_stream_server:register(),
     {ok, init_stream, #data{file_name = LogFile,
-                            txns_buffer = dict:new(),
+                            txns_buffer = #{},
                             partition = Partition,
                             file_poll_backoff = FilePollBackoff1,
                             port_retry_backoff = PortSendBackoff1,
@@ -174,7 +185,7 @@ log_path(Partition) ->
 
 init_stream({call, {Sender, _} = F}, {start_replication, Port, Opts}, Data) ->
     %% FIXME: We support only single partition for now
-    _Offset = case proplists:get_value(offset, Opts) of
+    WalOffset = case proplists:get_value(offset, Opts, none) of
                   none -> 0;
                   Offset -> Offset
               end,
@@ -188,6 +199,8 @@ init_stream({call, {Sender, _} = F}, {start_replication, Port, Opts}, Data) ->
 
     {next_state, await_data, Data#data{client = Sender,
                                        mon_ref = MonRef,
+                                       file_pos = WalOffset,
+                                       file_buff = [],
                                        file_desc = FD,
                                        file_poll_backoff = Backoff,
                                        port = Port
@@ -228,7 +241,7 @@ await_data({call, Sender}, {stop_replication}, Data) ->
         end,
     {next_state, init_stream, #data{file_name = Data#data.file_name,
                                     file_status = more_data,
-                                    txns_buffer = dict:new(),
+                                    txns_buffer = #{},
                                     partition = Data#data.partition,
                                     file_poll_backoff = FBackoff,
                                     port_retry_backoff = PBackoff
@@ -349,6 +362,20 @@ read_ops_from_log(Data) ->
             Error
     end.
 
+
+%% 1. First of all figure out how do we get offset per transaction.
+%% (offset where trans starts).
+
+%% Offset should correspond to the earliest transaction across all tx that are in
+%% buffer.
+
+%% 2. For every source DC - keep the last transaction that have been send.
+%% This to be used, to skip some of the transaction that go from offset.
+
+%% Maybe this is not even required, just keep the last transaction that you have send
+%% before that, given that we intend to have deterministic order anyway? Maybe not,
+%% as there might be several transactions which intersect with the one that we are sending
+%% but for one trans we have already send, while other we have not.
 read_ops_from_log(#data{txns_buffer = TxnBuff,
                         file_pos = FPos,
                         file_buff = FBuff,
@@ -385,8 +412,14 @@ read_ops_from_log(#data{txns_buffer = TxnBuff,
             end
     end.
 
--type txns_noncomitted_map() :: dict:dict(antidote:txid(), [any_log_payload()]).
--type txns_comitted()   :: [ { antidote:txid(), term() } ].
+-type txns_noncomitted_map() :: #{antidote:txid() =>
+                                      { file_offset(), [any_log_payload()]}
+                                 }.
+-type txns_comitted() :: [ { antidote:txid(),
+                             antidote:dcid(),
+                             antidote:clock_time(),
+                             file_offset(),
+                             term() } ].
 
 -spec read_ops_from_log(file:fd(), file:filename_all(), non_neg_integer(), term(),
                         txns_noncomitted_map()) ->
@@ -401,7 +434,18 @@ read_ops_from_log(Fd, FileName, FPos, FBuffer, RemainingOps) ->
         {error, _} = Error ->
             Error;
         {ok, LogPosition, NewTerms}->
-            {ok, LogPosition, process_txns(NewTerms, RemainingOps, [])}
+            TxOffset = generate_pos_in_log({FPos, FBuffer}),
+            {ok, LogPosition, process_txns(NewTerms, RemainingOps, [], TxOffset)}
+    end.
+
+%% If we have emitted new terms -> we can consider offset to be Pos - size(Binary) - headersz
+%% If we have not emitted new terms -> we do not update offset, as we expect that the
+%% chunk was larger then the MAX_CHUNK_SIXE in disk_log
+%% If eof we simple retry with the buffe and last settings
+generate_pos_in_log({FPos, FBuf}) ->
+    case FBuf of
+        [] -> FPos;
+        B  -> FPos - byte_size(B) - 8 %% HEADERSZ from disk_log
     end.
 
 -type log_position() :: {non_neg_integer(), Buffer :: term()}.
@@ -427,102 +471,119 @@ read_chunk(Fd, FileName, FPos, FBuff, Amount) ->
             {eof, {FPos, FBuff}, []}
     end.
 
-process_txns([], RemainingOps, FinalizedTxns) ->
+-type file_offset() :: non_neg_integer().
+
+-spec process_txns([{term(), #log_record{}}], txns_noncomitted_map(), txns_comitted(),
+                   file_offset()) ->
+          {txns_noncomitted_map(), txns_comitted()}.
+process_txns([], RemainingOps, FinalizedTxns, _) ->
     {RemainingOps, preprocess_comitted(lists:reverse(FinalizedTxns))};
-process_txns([{_, LogRecord} | Rest], RemainingOps, FinalizedTxns0) ->
+process_txns([{_, LogRecord} | Rest], RemainingOps, FinalizedTxns0, TxOffset) ->
     #log_record{log_operation = LogOperation} = log_utilities:check_log_record_version(LogRecord),
 
     {RemainingOps1, FinalizedTxns1} =
-        process_op(LogOperation, RemainingOps, FinalizedTxns0),
-    process_txns(Rest, RemainingOps1, FinalizedTxns1).
+        process_op(LogOperation, RemainingOps, FinalizedTxns0, TxOffset),
+    process_txns(Rest, RemainingOps1, FinalizedTxns1, TxOffset).
 
 process_op(#log_operation{op_type = OpType, tx_id = TxId, log_payload = Payload},
-           RemainingOps, FinalizedTxns) when OpType == update
-                                             orelse OpType == update_start ->
+           RemainingOps, FinalizedTxns, TxOffset)
+  when OpType == update orelse
+       OpType == update_start ->
     {Key, Type, Op} = { Payload#update_log_payload.key,
                         Payload#update_log_payload.type,
                         Payload#update_log_payload.op
                   },
-    {dict:append(TxId, {Key, Type, Op}, RemainingOps), FinalizedTxns};
-process_op(#log_operation{op_type = prepare}, RemainingOps, FinalizedTxns) ->
+    RemainingOps1 =
+        maps:update_with(TxId, fun({Offset, Ops}) ->
+                                       {Offset, [{Key, Type, Op} | Ops]}
+                               end,
+                         {TxOffset, [{Key, Type, Op}]}, RemainingOps),
+    {RemainingOps1, FinalizedTxns};
+process_op(#log_operation{op_type = prepare}, RemainingOps, FinalizedTxns, _) ->
     {RemainingOps, FinalizedTxns};
-process_op(#log_operation{op_type = abort, tx_id = TxId}, RemainingOps, FinalizedTxns) ->
-     case dict:take(TxId, RemainingOps) of
-        {_, RemainingOps1} ->
-             %% NOTE: We still want to know about this transaction to not loose
-             %% track of last transaction id.
-            {RemainingOps1,
-             [prepare_txn_operations(TxId, aborted) |FinalizedTxns]};
-        error ->
-            logger:warning("Empty transaction: ~p~n", [TxId]),
-            {RemainingOps, FinalizedTxns}
-    end;
+process_op(#log_operation{op_type = abort, tx_id = TxId}, RemainingOps, FinalizedTxns, _) ->
+    RemainingOps1 = maps:remove(TxId, RemainingOps),
+    %% NOTE: We still want to know about this transaction to not loose
+    %% track of last transaction id.
+    {RemainingOps1, [prepare_txn_operations(TxId, aborted) | FinalizedTxns]};
 process_op(#log_operation{op_type = commit, tx_id = TxId, log_payload = Payload},
-           RemainingOps, FinalizedTxns) ->
+           RemainingOps, FinalizedTxns, _) ->
     #commit_log_payload{commit_time = {DcId, TxCommitTime},
                         snapshot_time = ST
                        } = Payload,
     TxST = vectorclock:set(DcId, TxCommitTime, ST),
 
-    case dict:take(TxId, RemainingOps) of
-        {TxOpsList, RemainingOps1} ->
+    case maps:take(TxId, RemainingOps) of
+        {{TxOffset, TxOpsList}, RemainingOps1} ->
+            %% Sort TxOpsList according to file order
             {RemainingOps1,
-             [prepare_txn_operations(TxId, TxST, TxOpsList)
+             [prepare_txn_operations(TxId, TxST, DcId, TxCommitTime, TxOffset,
+                                     lists:reverse(TxOpsList))
              | FinalizedTxns]};
         error ->
             logger:warning("Empty transaction: ~p~n", [TxId]),
             {RemainingOps, FinalizedTxns}
     end.
 
-prepare_txn_operations(TxId, ST, TxOpsList0) ->
-    TxOpsDict =   lists:foldl(fun({Key, Type, Op}, Acc) ->
+prepare_txn_operations(TxId, TxST, DcId, TxCommitTime, TxOffset, TxOpsList0) ->
+    TxOpsDict = lists:foldl(fun({Key, Type, Op}, Acc) ->
                                   dict:append({Key, Type}, Op, Acc)
                               end, dict:new(), TxOpsList0),
-    TxKeys = sets:to_list(sets:from_list(lists:map(fun({Key, Type, _Op}) -> {Key, Type} end, TxOpsList0))),
+    TxKeys = sets:to_list(
+               sets:from_list(
+                 lists:map(fun({Key, Type, _Op}) -> {Key, Type} end, TxOpsList0))),
     TxMaterializedKeysWithOps =
         lists:map(fun({Key, Type}) ->
-                          {Key, Type, materialize(Key, Type, ST, TxId), dict:fetch({Key, Type}, TxOpsDict)}
+                          {Key, Type, materialize(Key, Type, TxST, TxId), dict:fetch({Key, Type}, TxOpsDict)}
                   end, TxKeys),
     logger:info("processed txn:~n ~p ~p~n", [TxId, TxMaterializedKeysWithOps]),
-    {TxId, TxMaterializedKeysWithOps}.
+    ?READ_TXN(TxId, DcId, TxCommitTime, TxOffset, TxMaterializedKeysWithOps).
 
 prepare_txn_operations(TxId, aborted) ->
-    {TxId, aborted}.
+    ?READ_TXN(TxId, none, none, none, aborted).
 
 preprocess_comitted(L) ->
     L.
 
 notify_client([], Data) ->
     {ok, Data};
-notify_client(FinalyzedTxns, #data{port = Port} = Data) ->
-    case notify_client0(FinalyzedTxns, undefined, Port) of
-        {ok, LastTxId} ->
+notify_client(FinalyzedTxns, #data{port = Port, last_send_map = SM} = Data) ->
+    case notify_client0(FinalyzedTxns, undefined, Port, SM) of
+        {ok, LastTxId, SM1} ->
             {ok, Data#data{last_read_txid = LastTxId,
+                           last_send_map = SM1,
                            to_send = []
                           }};
-        {retry, NotSendTxns} ->
-            {retry, set_port_send_timer(Data#data{to_send = NotSendTxns})};
+        {retry, NotSendTxns, SM1} ->
+            {retry, set_port_send_timer(
+                      Data#data{to_send = NotSendTxns,
+                                last_send_map = SM1
+                               })};
         {error, Reason} ->
             {error, Reason}
     end.
 
-notify_client0(D = [{TxId, TxOpsList} | FinalyzedTxns], _LastTxn, Port)
+notify_client0(D = [?READ_TXN(TxId, DcId, TxCommitTime, TxOffset, TxOpsList)
+                   | FinalyzedTxns], _LastTxn, Port, SM)
  when is_list(TxOpsList)->
+
     case
-        vx_wal_tcp_worker:send(Port, TxId, TxId, TxOpsList)
+        vx_wal_tcp_worker:send(Port, TxId, TxOffset, TxOpsList)
     of
         false ->
             %% We need to retry later, port is busy
-            {retry, D};
+            {retry, D, SM};
         true ->
-            notify_client0(FinalyzedTxns, TxId, Port);
+            SM1 = SM#{ DcId => TxCommitTime },
+            notify_client0(FinalyzedTxns, TxId, Port, SM1);
         {error, Reason} ->
             {error, Reason}
     end;
-notify_client0([{TxId, aborted} | FinalyzedTxns], _LastTxn, Port) ->
-    notify_client0(FinalyzedTxns, TxId, Port);
-notify_client0([], LastTxn, _) ->
-    {ok, LastTxn}.
+notify_client0([?READ_TXN(TxId, none, none, none, aborted)
+               | FinalyzedTxns], _LastTxn, Port, SM) ->
+    notify_client0(FinalyzedTxns, TxId, Port, SM);
+notify_client0([], LastTxn, _, SM) ->
+    {ok, LastTxn, SM}.
 
 -ifdef(TEST).
 

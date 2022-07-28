@@ -17,15 +17,17 @@ all() ->
 
 groups() ->
     [{setup_node, [],
-      [ {setup_meck, [], [sanity_check,
-                          single_txn,
-                          single_txn_from_history,
-                          single_txn_from_history2
-                         ]
-        },
-        single_txn_via_client,
-        multiple_txns_via_client,
-        merged_values_within_txn
+      [
+        %% {setup_meck, [], [sanity_check,
+        %%                   single_txn,
+        %%                   single_txn_from_history,
+        %%                   single_txn_from_history2
+        %%                  ]
+        %% },
+        %% single_txn_via_client,
+        %% multiple_txns_via_client,
+        %% m erged_values_within_txn
+        replication_from_position
       ]}
     ].
 
@@ -46,8 +48,8 @@ init_per_group(setup_node, Config) ->
 init_per_group(setup_meck, _Config) ->
     meck:new(vx_wal_tcp_worker, [no_link, passthrough]),
     meck:expect(vx_wal_tcp_worker, send,
-                fun(Port, TxId, TxOpsList) ->
-                        Port ! {wal_msg, TxId, TxOpsList}, true
+                fun(Port, TxId, TxOffset, TxOpsList) ->
+                        Port ! {wal_msg, TxId, TxOffset, TxOpsList}, true
                 end).
 
 end_per_group(setup_meck, Config) ->
@@ -75,7 +77,7 @@ single_txn() ->
 
 single_txn(_Config) ->
     {Key, Bucket, Type, Value} = {key_a, <<"my_bucket">>, antidote_crdt_counter_pn, 5},
-    {ok, SN} = simple_update_value([{Key, Value}], Bucket),
+    {ok, _SN} = simple_update_value([{Key, Value}], Bucket),
     assert_receive(100),
 
     {ok, Pid} = vx_wal_stream:start_link([]),
@@ -86,7 +88,7 @@ single_txn(_Config) ->
 
     K = key_format(Key, Bucket),
     Ops = [5],
-    ?assertMatch({wal_msg, _Txn, [{K, Type, Value, Ops}]}, Msg),
+    ?assertMatch({wal_msg, _Txn, _Offset, [{K, Type, Value, Ops}]}, Msg),
 
     ok = vx_wal_stream:stop_replication(Pid).
 
@@ -102,7 +104,7 @@ single_txn_from_history(_Config) ->
 
     K = key_format(Key, Bucket),
     Ops = [5],
-    ?assertMatch({wal_msg, _Txn, [{K, Type, Value, Ops}]}, Msg),
+    ?assertMatch({wal_msg, _Txn, _Offset, [{K, Type, Value, Ops}]}, Msg),
 
     assert_receive(100),
 
@@ -111,7 +113,7 @@ single_txn_from_history(_Config) ->
 single_txn_from_history2() ->
     ?comment("When database has single transaction we get it when starting replication").
 single_txn_from_history2(_Config) ->
-    {Key, Bucket, Type, Value} = {key_a, <<"my_bucket">>, antidote_crdt_counter_pn, 5},
+    {Key, Bucket, Type, _Value} = {key_a, <<"my_bucket">>, antidote_crdt_counter_pn, 5},
 
     {ok, Pid} = vx_wal_stream:start_link([]),
     {ok, _}   = vx_wal_stream:start_replication(Pid, self(), []),
@@ -119,26 +121,26 @@ single_txn_from_history2(_Config) ->
     ct:log("~p message: ~p~n", [?LINE, Msg]),
 
     K = key_format(Key, Bucket),
-    ?assertMatch({wal_msg, _Txn, [{K, Type, 5, [5]}]}, Msg),
+    ?assertMatch({wal_msg, _Txn, _Offset, [{K, Type, 5, [5]}]}, Msg),
 
     assert_receive(100),
 
-    {ok, SN1} = simple_update_value([{Key, 6}], Bucket),
+    {ok, _SN1} = simple_update_value([{Key, 6}], Bucket),
     [Msg1] = assert_count(1, 1000),
     ct:log("~p message: ~p~n", [?LINE, Msg1]),
 
     Ops2 = [6],
-    ?assertMatch({wal_msg, _Txn, [{K, Type, 11, Ops2}]}, Msg1),
+    ?assertMatch({wal_msg, _Txn, _Offset, [{K, Type, 11, Ops2}]}, Msg1),
 
     assert_receive(100),
     ok = vx_wal_stream:stop_replication(Pid).
 
 single_txn_via_client() ->
     ?comment("").
-single_txn_via_client(Config) ->
-    {Key, Bucket, Type, Value} = {key_d, <<"client_bucket">>, antidote_crdt_counter_pn, 5},
+single_txn_via_client(_Config) ->
+    {Key, Bucket, Type, _Value} = {key_d, <<"client_bucket">>, antidote_crdt_counter_pn, 5},
 
-    {ok, SN1} = simple_update_value([{Key, 5}], <<"client_bucket">>),
+    {ok, _SN1} = simple_update_value([{Key, 5}], <<"client_bucket">>),
 
     {ok, C} = vx_client:connect("127.0.0.1",
                                 vx_test_utils:port(vx_server, pb_port, 0), []),
@@ -160,13 +162,13 @@ single_txn_via_client(Config) ->
 multiple_txns_via_client() ->
     ?comment("").
 multiple_txns_via_client(_Config) ->
-    {Key, Bucket, Type, Value} = {key_d, <<"client_bucket">>, antidote_crdt_counter_pn, 11},
+    {Key, Bucket, Type, _Value} = {key_d, <<"client_bucket">>, antidote_crdt_counter_pn, 11},
 
     {ok, C} = vx_client:connect("127.0.0.1",
                                 vx_test_utils:port(vx_server, pb_port, 0), []),
     ok = vx_client:start_replication(C, []),
 
-    M = [_, _, Msg1, Msg2] = assert_count(4, 1000),
+    [_, _, Msg1, Msg2] = assert_count(4, 1000),
     ct:log("~p messages: ~p~n~p~n", [?LINE, Msg1, Msg2]),
 
     K = key_format(Key, Bucket),
@@ -179,7 +181,7 @@ multiple_txns_via_client(_Config) ->
                                                    ops = [{K, Type, 11, [6]}]
                                                  }}, Msg2),
 
-    {ok, SN1} = simple_update_value([{Key, 6}], <<"client_bucket">>),
+    {ok, _SN1} = simple_update_value([{Key, 6}], <<"client_bucket">>),
 
     [Msg3] = assert_count(1, 1000),
     ?assertMatch(#vx_client_msg{pid = C,
@@ -198,7 +200,7 @@ merged_values_within_txn(_Config) ->
                                 vx_test_utils:port(vx_server, pb_port, 0), []),
     ok = vx_client:start_replication(C, []),
     %% Skip first messages
-    M = [_, _, _, _, _] = assert_count(5, 1000),
+    [_, _, _, Msg4, Msg5] = assert_count(5, 1000),
 
     {ok, _} = simple_update_value([{Key, 2}, {Key, 2}], Bucket),
     [Msg] = assert_count(1, 1000),
@@ -207,8 +209,45 @@ merged_values_within_txn(_Config) ->
                                                    ops = [{K, Type, 4, [2, 2]}]
                                                  }}, Msg),
     ok = vx_client:stop_replication(C),
+
+    WalOffset = (Msg4#vx_client_msg.msg)#vx_wal_txn.wal_offset,
+    {ok, C1} = connect(),
+    ok = vx_client:start_replication(C1, [{offset, WalOffset}]),
+
+    ct:log("Expect to receive some messages, start with offset ~p~n", [WalOffset]),
+    [Msg41, Msg51] = assert_count(2, 1000),
+
+    ok = vx_client:stop_replication(C),
     ok.
 
+replication_from_position(_Config) ->
+    {Key, Bucket, Type, _Value} = {key_w, <<"u_bucket">>, antidote_crdt_counter_pn, 0},
+    {ok, C} = vx_client:connect("127.0.0.1",
+                                vx_test_utils:port(vx_server, pb_port, 0), []),
+    ok = vx_client:start_replication(C, []),
+
+    lists:foreach(fun(_) ->
+                          {ok, _} = simple_update_value([{Key, 2}, {Key, 2}], Bucket)
+                  end, lists:seq(1, 5)),
+
+    %% Skip first messages
+    [_, _, _, Msg4, Msg5] = assert_count(5, 1000),
+
+    ok = vx_client:stop_replication(C),
+
+    WalOffset = (Msg4#vx_client_msg.msg)#vx_wal_txn.wal_offset,
+    {ok, C1} = connect(),
+    ok = vx_client:start_replication(C1, [{offset, WalOffset}]),
+
+    ct:log("Expect to receive some messages, start with offset ~p~n", [WalOffset]),
+    [Msg41, Msg51] = assert_count(2, 1000),
+
+    ok = vx_client:stop_replication(C1),
+    ok.
+
+connect() ->
+    vx_client:connect("127.0.0.1",
+                                vx_test_utils:port(vx_server, pb_port, 0), []).
 
 %------------------------------------------------------------------------------
 
@@ -248,6 +287,7 @@ assert_count(0, _Timeout) ->
 assert_count(N, Timeout) ->
     receive
         M ->
+            ct:log("received: ~p~n", [M]),
             [M | assert_count(N-1, Timeout)]
     after Timeout ->
               erlang:error({not_sufficient_msg_count, N})
