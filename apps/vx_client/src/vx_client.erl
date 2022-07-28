@@ -12,6 +12,7 @@
 
 %% FIXME: Currently snapshot is ignored
 -type snapshot() :: term().
+-type wal_offset() :: term().
 
 -type sub_id() :: reference().
 -type address() :: inet:socket_address() | inet:hostname().
@@ -30,7 +31,8 @@ disconnect(Pid) ->
 %%
 %% Once the replication started the client of this API is expected to
 %% receive #vx_client_msg messages:
--spec start_replication(pid(), list()) -> ok | {error, term()}.
+-spec start_replication(pid(), [{offset, wal_offset()}]) ->
+          ok | {error, term()}.
 start_replication(Pid, Options) ->
     vx_client_socket:start_replication(Pid, Options).
 

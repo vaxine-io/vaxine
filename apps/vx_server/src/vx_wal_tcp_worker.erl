@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 -export([ start_link/3,
-          send/3
+          send/4
         ]).
 -export([ init/1,
           handle_call/3,
@@ -24,9 +24,11 @@ start_link(Ref, Transport, ProtoOpts) ->
     Pid = proc_lib:spawn_link(?MODULE, init, [{Ref, Transport, ProtoOpts}]),
     {ok, Pid}.
 
--spec send(port(), term(), term()) -> boolean() | {error, term()}.
-send(Port, TxId, TxOpsList) ->
-    Msg = #vx_wal_txn{ txid = TxId, ops = TxOpsList },
+-spec send(port(), antidote:txid(), vx_wal_stream:wal_offset(), tx_ops()) ->
+          boolean() | {error, term()}.
+send(Port, TxId, Offset, TxOpsList) ->
+    Msg = #vx_wal_txn{ txid = TxId, wal_offset = Offset,
+                       ops = TxOpsList },
     Binary = term_to_binary(Msg),
     try
         erlang:port_command(Port, Binary, [nosuspend])
@@ -103,10 +105,10 @@ handle_vx_wal_protocol(BinaryReq, _State) ->
 -spec handle_request(term(), term()) ->
           {noreply, term(), term()} | {error, term()}.
 handle_request(#vx_cli_req{ref = Ref,
-                           msg = #vx_cli_start_req{}
+                           msg = #vx_cli_start_req{opts = Opts}
                           }, State) ->
     {ok, Pid} = vx_wal_stream:start_link([]),
-    case vx_wal_stream:start_replication(Pid, State#state.socket, []) of
+    case vx_wal_stream:start_replication(Pid, State#state.socket, Opts) of
         {ok, _} ->
             RepId = make_ref(),
             {noreply, #vx_srv_res{ref = Ref, msg = #vx_srv_start_res{rep_id = RepId}},

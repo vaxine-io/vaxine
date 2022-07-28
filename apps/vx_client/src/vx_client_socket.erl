@@ -70,7 +70,10 @@ stop(Pid) ->
 %% confirmations that N amount of events have been processed before sending more
 %% messages to the client. This is the simple measure to protect the client code
 %% from overloading.
--spec start_replication(pid(), [require_ack]) -> ok | {error, term()}.
+-spec start_replication(pid(), [require_ack
+                               | {offset, wal_offset()}
+                               ]) ->
+          ok | {error, term()}.
 start_replication(Pid, Opts) ->
     call_request(Pid, {start_replication, Opts}).
 
@@ -133,7 +136,7 @@ handle_call(Msg, _, State) ->
     logger:warning("unhandled call msg: ~p~n", [Msg]),
     {reply, {error, not_implemented}, State}.
 
-handle_cast({get_next_bulk, N}, State) ->
+handle_cast({get_next_bulk, _N}, State) ->
     {noreply, State};
 handle_cast(Msg, State) ->
     logger:warning("unhandled cast msg: ~p~n", [Msg]),
@@ -207,6 +210,7 @@ handle_server_msg({error, Term}, State) ->
 
 handle_client_msg({start_replication, Opts}, CliRef, State) ->
     RequireAck = proplists:get_bool(require_ack, Opts),
+    Offset = proplists:get_value(offset, Opts, none),
     case RequireAck of
         true ->
             {reply, {error, {require_ack,is_not_supported}}, State};
@@ -214,7 +218,9 @@ handle_client_msg({start_replication, Opts}, CliRef, State) ->
             case State#state.wal_replication of
                 undefined ->
                     send_request(
-                      #vx_cli_req{msg = #vx_cli_start_req{}}, CliRef, State);
+                      #vx_cli_req{msg =
+                                      #vx_cli_start_req{opts = [{offset, Offset}]}
+                                 }, CliRef, State);
                 RepId ->
                     {reply, {error, {already_started, RepId}}, State}
             end

@@ -61,10 +61,14 @@
                port :: port() | undefined
               }).
 
+-type wal_offset() :: term().
+
 -record(commit, { partition :: antidote:partition_id(),
                   txid :: antidote:txid(),
                   snapshot :: snapshot_time()
                 }).
+
+-export_type([wal_offset/0]).
 
 -spec start_link(list()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Args) ->
@@ -74,8 +78,8 @@ start_link(Args) ->
 %% vx_wal_tcp_worker.
 -spec start_replication(pid(), port(), list()) ->
           {ok, pid()} | {error, term()}.
-start_replication(Pid, Port, _DiskLogPos) ->
-    gen_statem:call(Pid, {start_replication, Port}, infinity).
+start_replication(Pid, Port, DiskLogOpts) ->
+    gen_statem:call(Pid, {start_replication, Port, DiskLogOpts}, infinity).
 
 %% @doc Ask vx_wal_stream to stop replicating of the data. At the moment it's not
 %% possible to pause and resume replication. Process does not expect any further
@@ -168,8 +172,12 @@ log_path(Partition) ->
     LogId = LogFile ++ "--" ++ LogFile,
     filename:join(DataDir, LogId).
 
-init_stream({call, {Sender, _} = F}, {start_replication, Port}, Data) ->
+init_stream({call, {Sender, _} = F}, {start_replication, Port, Opts}, Data) ->
     %% FIXME: We support only single partition for now
+    _Offset = case proplists:get_value(offset, Opts) of
+                  none -> 0;
+                  Offset -> Offset
+              end,
     {ok, FD} = open_log(Data#data.file_name),
     MonRef = erlang:monitor(process, Sender),
 
@@ -501,7 +509,7 @@ notify_client(FinalyzedTxns, #data{port = Port} = Data) ->
 notify_client0(D = [{TxId, TxOpsList} | FinalyzedTxns], _LastTxn, Port)
  when is_list(TxOpsList)->
     case
-        vx_wal_tcp_worker:send(Port, TxId, TxOpsList)
+        vx_wal_tcp_worker:send(Port, TxId, TxId, TxOpsList)
     of
         false ->
             %% We need to retry later, port is busy
